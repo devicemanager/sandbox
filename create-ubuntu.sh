@@ -16,7 +16,6 @@ DISK_STORAGE_ID="${DISK_STORAGE_ID:-local-lvm}"
 DISK_SIZE_GB="${DISK_SIZE_GB:-16}"
 
 BRIDGE_SBX="${BRIDGE_SBX:-vmbr_sbx}"
-BRIDGE_WAN="${BRIDGE_WAN:-vmbr0}"
 
 MEMORY_MB="${MEMORY_MB:-2048}"
 CORES="${CORES:-2}"
@@ -24,7 +23,8 @@ CPU_TYPE="${CPU_TYPE:-x86-64-v2-AES}"
 MACHINE_TYPE="${MACHINE_TYPE:-q35}"
 BIOS_TYPE="${BIOS_TYPE:-seabios}"
 
-need() { command -v "$1" >/dev/null 2>&1 || exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }; }
+
 need qm
 need xorriso
 need openssl
@@ -32,7 +32,12 @@ need sed
 need awk
 need ip
 
-if ! command -v 7zz >/dev/null 2>&1 && ! command -v 7z >/dev/null 2>&1; then
+if command -v 7zz >/dev/null 2>&1; then
+  UNZIP=7zz
+elif command -v 7z >/dev/null 2>&1; then
+  UNZIP=7z
+else
+  echo "Missing 7zz/7z (install package: 7zip or p7zip-full)" >&2
   exit 1
 fi
 
@@ -70,8 +75,6 @@ EOF
   ip link show "$br" >/dev/null 2>&1
 }
 
-ensure_bridge "$BRIDGE_SBX" || { echo "Failed to create bridge $BRIDGE_SBX" >&2; exit 1; }
-
 create_vm_if_missing() {
   if qm status "$VMID" >/dev/null 2>&1; then
     return 0
@@ -86,23 +89,42 @@ create_vm_if_missing() {
     --bios "${BIOS_TYPE}"
 
   qm set "$VMID" --scsihw 'virtio-scsi-pci'
-  qm set "$VMID" --vga 'serial0'
   qm set "$VMID" --serial0 'socket'
+  qm set "$VMID" --vga 'serial0'
   qm set "$VMID" --net0 "virtio,bridge=${BRIDGE_SBX}"
   qm set "$VMID" --scsi0 "${DISK_STORAGE_ID}:${DISK_SIZE_GB}"
 }
 
-PW_HASH="$(openssl passwd -6 "${PASSWORD_PLAIN}")"
-
-_extract_iso() {
+extract_iso() {
   local iso="$1"
   local outdir="$2"
   mkdir -p "$outdir"
-  if command -v 7zz >/dev/null 2>&1; then
-    7zz x "$iso" "-o${outdir}" >/dev/null
-  else
-    7z x "$iso" "-o${outdir}" >/dev/null
-  fi
+  "$UNZIP" x "$iso" "-o${outdir}" >/dev/null
+}
+
+patch_grub_autoinstall_serial() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+
+  local ds='autoinstall ds=nocloud\;s=/cdrom/nocloud/'
+  local con='console=tty0 console=ttyS0,115200n8,keep'
+
+  awk -v ds="$ds" -v con="$con" '
+    /^[[:space:]]*linux[[:space:]]+/ {
+      line=$0
+      sub(/[[:space:]]+---([[:space:]]+|$)/, " ", line)
+      sub(/[[:space:]]+---([[:space:]]+|$)/, " ", line)
+      gsub(/[[:space:]]+/, " ", line)
+      if (line !~ /console=ttyS0/) line = line " " con
+      if (line !~ /autoinstall/) line = line " " ds
+      line = line " ---"
+      gsub(/[[:space:]]+/, " ", line)
+      print line
+      next
+    }
+    { print }
+  ' "$f" > "${f}.new"
+  mv "${f}.new" "$f"
 }
 
 build_custom_iso() {
@@ -113,9 +135,11 @@ build_custom_iso() {
   workdir="$(mktemp -d)"
   trap 'rm -rf "$workdir"' RETURN
 
-  _extract_iso "$in_iso" "$workdir/iso"
+  extract_iso "$in_iso" "$workdir/iso"
 
   mkdir -p "$workdir/iso/nocloud"
+
+  PW_HASH="$(openssl passwd -6 "${PASSWORD_PLAIN}")"
 
   cat > "$workdir/iso/nocloud/meta-data" <<EOF
 instance-id: ${HOSTNAME}-${VMID}
@@ -145,21 +169,19 @@ autoinstall:
       name: lvm
   late-commands:
     - curtin in-target --target=/target systemctl enable serial-getty@ttyS0.service
-    - curtin in-target --target=/target bash -lc 'sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\\"console=ttyS0,115200n8 console=tty0\\"/" /etc/default/grub'
+    - curtin in-target --target=/target bash -lc 'sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\\"console=ttyS0,115200n8,keep console=tty0\\"/" /etc/default/grub'
     - curtin in-target --target=/target bash -lc 'grep -q "^GRUB_TERMINAL" /etc/default/grub || echo "GRUB_TERMINAL=serial" >> /etc/default/grub'
     - curtin in-target --target=/target bash -lc 'grep -q "^GRUB_SERIAL_COMMAND" /etc/default/grub || echo "GRUB_SERIAL_COMMAND=\\"serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1\\"" >> /etc/default/grub'
     - curtin in-target --target=/target update-grub
 EOF
 
-  local ds="autoinstall ds=nocloud\\;s=/cdrom/nocloud/"
-  local con="console=ttyS0,115200n8"
+  patch_grub_autoinstall_serial "$workdir/iso/boot/grub/grub.cfg"
+  patch_grub_autoinstall_serial "$workdir/iso/boot/grub/loopback.cfg"
 
-  for f in "$workdir/iso/boot/grub/grub.cfg" "$workdir/iso/boot/grub/loopback.cfg"; do
-    [[ -f "$f" ]] || continue
-    sed -i -E "s@^(\\s*linux\\s+[^ ]+)\\s*(.*)@\\1 \\2 ${ds} ${con}@g" "$f"
-  done
-
-  [[ -e "$workdir/iso/[BOOT]/1-Boot-NoEmul.img" && -e "$workdir/iso/[BOOT]/2-Boot-NoEmul.img" ]] || exit 1
+  [[ -e "$workdir/iso/[BOOT]/1-Boot-NoEmul.img" && -e "$workdir/iso/[BOOT]/2-Boot-NoEmul.img" ]] || {
+    echo "Missing [BOOT] images in extracted ISO; cannot rebuild with current method." >&2
+    exit 1
+  }
 
   xorriso -as mkisofs \
     -r -V "Ubuntu-Server-Autoinstall" \
@@ -178,6 +200,7 @@ EOF
     "$workdir/iso" >/dev/null
 }
 
+ensure_bridge "$BRIDGE_SBX" || { echo "Failed to create bridge $BRIDGE_SBX" >&2; exit 1; }
 create_vm_if_missing
 
 if [[ ! -f "$OUT_ISO" || "$OUT_ISO" -ot "$IN_ISO" ]]; then
