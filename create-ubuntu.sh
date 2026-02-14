@@ -1,4 +1,4 @@
-i#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 VMID="${1:?Usage: $0 <vmid>}"
