@@ -23,12 +23,14 @@ CPU_TYPE="${CPU_TYPE:-x86-64-v2-AES}"
 MACHINE_TYPE="${MACHINE_TYPE:-q35}"
 BIOS_TYPE="${BIOS_TYPE:-seabios}"
 
+WORKBASE="${WORKBASE:-/var/lib/vz/tmp}"
+mkdir -p "$WORKBASE"
+
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }; }
 
 need qm
 need xorriso
 need openssl
-need sed
 need awk
 need ip
 
@@ -164,26 +166,30 @@ autoinstall:
       name: lvm
   late-commands:
     - curtin in-target --target=/target systemctl enable serial-getty@ttyS0.service
-    - curtin in-target --target=/target bash -lc "sed -i -E 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"console=ttyS0,115200n8,keep console=tty0\"/' /etc/default/grub"
-    - curtin in-target --target=/target bash -lc "grep -q '^GRUB_TERMINAL=' /etc/default/grub && sed -i -E 's/^GRUB_TERMINAL=.*/GRUB_TERMINAL=serial/' /etc/default/grub || echo 'GRUB_TERMINAL=serial' >> /etc/default/grub"
-    - curtin in-target --target=/target bash -lc "grep -q '^GRUB_SERIAL_COMMAND=' /etc/default/grub && sed -i -E 's/^GRUB_SERIAL_COMMAND=.*/GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1\"/' /etc/default/grub || echo 'GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1\"' >> /etc/default/grub"
+    - curtin in-target --target=/target mkdir -p /etc/default/grub.d
+    - |
+      curtin in-target --target=/target bash -lc 'cat > /etc/default/grub.d/99-serial.cfg <<EOF
+GRUB_TERMINAL=serial
+GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"
+GRUB_CMDLINE_LINUX="console=ttyS0,115200n8,keep console=tty0"
+EOF'
     - curtin in-target --target=/target update-grub
 EOF
 }
 
 iso_selfcheck() {
   local iso="$1"
-  local tmp
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
+  local tmpdir=""
+  tmpdir="$(mktemp -d -p "${WORKBASE}" iso-selfcheck.XXXXXX)"
+  trap '[[ -n "${tmpdir:-}" && -d "${tmpdir:-}" ]] && rm -rf "$tmpdir"' RETURN
 
-  xorriso -osirrox on -indev "$iso" -extract /boot/grub/grub.cfg "$tmp/grub.cfg" >/dev/null 2>&1 || {
+  xorriso -osirrox on -indev "$iso" -extract /boot/grub/grub.cfg "$tmpdir/grub.cfg" >/dev/null 2>&1 || {
     echo "Selfcheck failed: cannot extract grub.cfg from $iso" >&2
     return 1
   }
 
   local line
-  line="$(grep -nE '^[[:space:]]*linux[[:space:]]+/casper/vmlinuz' "$tmp/grub.cfg" | head -n 1 || true)"
+  line="$(grep -nE '^[[:space:]]*linux[[:space:]]+/casper/vmlinuz' "$tmpdir/grub.cfg" | head -n 1 || true)"
   [[ -n "$line" ]] || { echo "Selfcheck failed: no vmlinuz linux line found" >&2; return 1; }
 
   echo "$line" | grep -q 'console=ttyS0,115200n8,keep' || { echo "Selfcheck failed: missing serial console" >&2; echo "$line" >&2; return 1; }
@@ -197,9 +203,9 @@ build_custom_iso() {
   local in_iso="$1"
   local out_iso="$2"
 
-  local workdir
-  workdir="$(mktemp -d)"
-  trap 'rm -rf "$workdir"' RETURN
+  local workdir=""
+  workdir="$(mktemp -d -p "${WORKBASE}" ubuntu-iso.XXXXXX)"
+  trap '[[ -n "${workdir:-}" && -d "${workdir:-}" ]] && rm -rf "$workdir"' RETURN
 
   extract_iso "$in_iso" "$workdir/iso"
 
